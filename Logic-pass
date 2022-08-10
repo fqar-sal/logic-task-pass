@@ -1,0 +1,8 @@
+Using python
+Q1
+s = "flexible!" s2 = string.replace("b","p") print(s2) // Output - "flexiple!" //Code to remove a character s3 =string.replace("!","") print(s3) //Output - "flexiple"
+Q2
+lower = 900 upper = 1000 print("Prime numbers between", lower, "and", upper, "are:") for num in range(lower, upper + 1): # all prime numbers are greater than 1 if num > 1: for i in range(2, num): if (num % i) == 0: break else: print(num)
+Q3
+Input : str = "fqar" c = 'e' Output : 4 'e' appears four times in str. Input : str = "abcefgaa" c = 'a' Output : 3 'a' appears three times in str.
+
