@@ -1,0 +1,1134 @@
+import sys
+import subprocess
+from PyQt6 import QtWidgets, QtGui, QtCore
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import (QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QFrame, 
+                             QSplitter, QTextEdit, QLabel, QPushButton, QLineEdit, QScrollArea, QGridLayout, 
+                             QComboBox, QSlider, QProgressBar, QSizePolicy, QCheckBox, QTabWidget, QSpinBox)
+import paramiko
+import logging
+import json
+import os
+from cryptography.fernet import Fernet
+import time
+import ipaddress
+import requests
+
+# Check if libpcap is available
+def check_libpcap():
+    try:
+        import pcap
+    except ImportError:
+        QMessageBox.critical(None, "Error", "No libpcap provider available! pcap won't be used. Please install libpcap.")
+        sys.exit(1)
+
+# Generate or load encryption key
+def load_key():
+    """Generate or load the encryption key."""
+    if os.path.exists("key.key"):
+        with open("key.key", "rb") as key_file:
+            return key_file.read()
+    else:
+        key = Fernet.generate_key()
+        with open("key.key", "wb") as key_file:
+            key_file.write(key)
+        return key
+
+key = load_key()
+cipher = Fernet(key)
+
+class Worker(QtCore.QThread):
+    """Worker thread for executing SSH commands."""
+    progress = pyqtSignal(str, str)
+    finished = pyqtSignal(str)
+    data_received = pyqtSignal(str, str)
+
+    def __init__(self, ip, username, password, enable_password, ssh_key_file, commands, command_delay, keep_active, interactive):
+        super().__init__()
+        self.ip = ip
+        self.username = username
+        self.password = password
+        self.enable_password = enable_password
+        self.ssh_key_file = ssh_key_file
+        self.commands = commands
+        self.command_delay = command_delay
+        self.keep_active = keep_active
+        self.interactive = interactive
+        self.running = True
+        self.ssh = None
+        self.shell = None
+
+    def run(self):
+        """Run the worker thread."""
+        self.execute_commands(self.ip)
+        self.finished.emit(self.ip)
+
+    def execute_commands(self, ip):
+        """Execute SSH commands on a given IP."""
+        try:
+            self.ssh = paramiko.SSHClient()
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(
+                hostname=ip,
+                port=22,
+                username=self.username,
+                password=self.password if not self.ssh_key_file else None,
+                key_filename=self.ssh_key_file if self.ssh_key_file else None,
+                timeout=10
+            )
+            self.shell = self.ssh.invoke_shell()
+            self.shell.settimeout(2)
+            time.sleep(1)
+            output = self.shell.recv(1000).decode()
+            self.progress.emit(ip, output)
+            if self.enable_password:
+                self.shell.send("enable\n")
+                time.sleep(1)
+                self.shell.send(self.enable_password + "\n")
+                time.sleep(1)
+                output = self.shell.recv(1000).decode()
+                self.progress.emit(ip, output)
+
+            if self.interactive:
+                while self.running:
+                    try:
+                        if self.shell.recv_ready():
+                            data = self.shell.recv(1024).decode()
+                            if data:
+                                self.data_received.emit(ip, data)
+                        time.sleep(0.1)
+                    except Exception as e:
+                        logging.error(f"Error receiving data from {ip}: {str(e)}")
+                        break
+            else:
+                for command in self.commands:
+                    if not self.running:
+                        break
+                    self.shell.send(command + "\n")
+                    time.sleep(self.command_delay)
+                    output = self.shell.recv(10000).decode()
+                    self.progress.emit(ip, output)
+                if not self.keep_active:
+                    self.ssh.close()
+        except Exception as e:
+            error_msg = f"Failed to connect to {ip}: {str(e)}"
+            logging.error(error_msg)
+            self.progress.emit(ip, error_msg)
+
+    def send_command(self, command):
+        """Send a command to the SSH shell."""
+        if self.shell:
+            try:
+                self.shell.send(command + "\n")
+            except Exception as e:
+                logging.error(f"Error sending command to {self.ip}: {str(e)}")
+
+    def close_connections(self):
+        """Close all SSH connections."""
+        self.running = False
+        if self.ssh:
+            self.ssh.close()
+
+class PingWorker(QtCore.QThread):
+    """Worker thread for pinging IPs."""
+    ping_result = pyqtSignal(str)
+
+    def __init__(self, ips, continuous=False, count=4):
+        super().__init__()
+        self.ips = ips
+        self.continuous = continuous
+        self.count = count
+        self.running = True
+
+    def run(self):
+        """Run the ping worker thread."""
+        for ip in self.ips:
+            try:
+                while self.running:
+                    # Adjust the command for Windows or Unix-based systems
+                    if os.name == 'nt':  # Windows
+                        command = ['ping', '-n', str(self.count), ip]
+                    else:  # Unix-based systems
+                        command = ['ping', '-c', str(self.count), ip]
+                    response = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                    if response.returncode == 0:
+                        self.ping_result.emit(f"Ping to {ip} successful\n{response.stdout.decode()}")
+                    else:
+                        self.ping_result.emit(f"Ping to {ip} failed\n{response.stderr.decode()}")
+
+                    if not self.continuous:
+                        break
+
+            except Exception as e:
+                self.ping_result.emit(f"Error pinging {ip}: {str(e)}")
+                break
+
+    def stop(self):
+        """Stop the ping worker thread."""
+        self.running = False
+
+class TracerouteWorker(QtCore.QThread):
+    """Worker thread for performing traceroute."""
+    traceroute_result = pyqtSignal(str)
+
+    def __init__(self, ip, max_hops=30):
+        super().__init__()
+        self.ip = ip
+        self.max_hops = max_hops
+        self.running = True
+
+    def run(self):
+        """Run the traceroute worker thread."""
+        try:
+            # Adjust the command for Windows or Unix-based systems
+            if os.name == 'nt':  # Windows
+                command = ['tracert', '-h', str(self.max_hops), '-d', self.ip]
+            else:  # Unix-based systems
+                command = ['traceroute', '-m', str(self.max_hops), '-n', self.ip]
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            for line in iter(process.stdout.readline, ''):
+                if line and self.running:
+                    self.traceroute_result.emit(line.strip())
+                elif not self.running:
+                    process.terminate()
+                    break
+            process.stdout.close()
+            process.stderr.close()
+            process.wait()
+        except Exception as e:
+            self.traceroute_result.emit(f"Error tracerouting {self.ip}: {str(e)}")
+
+    def stop(self):
+        """Stop the traceroute worker thread."""
+        self.running = False
+
+class ARPDiscoveryWorker(QtCore.QThread):
+    """Worker thread for ARP discovery."""
+    discovery_result = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        """Run the ARP discovery worker thread."""
+        try:
+            self.arp_discover()
+        except Exception as e:
+            self.discovery_result.emit(f"Error discovering devices: {str(e)}")
+
+    def arp_discover(self):
+        """Discover devices using ARP."""
+        # Get the ARP table from the OS
+        if os.name == 'nt':  # Windows
+            command = 'arp -a'
+        else:  # Unix-based systems
+            command = 'arp -n'
+
+        result = subprocess.run(command.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output = result.stdout.decode()
+
+        if result.returncode == 0:
+            lines = output.splitlines()
+            interface_arp_entries = {}
+            current_interface = None
+            for line in lines:
+                if line.startswith('Interface:'):
+                    current_interface = line.split()[1]
+                    interface_arp_entries[current_interface] = []
+                elif "Address" in line or not line.strip():
+                    continue
+                else:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    ip = parts[0]
+                    mac = parts[1]
+                    device_type = self.get_device_type(mac)
+                    interface_arp_entries[current_interface].append((ip, mac, device_type))
+
+            for interface, entries in interface_arp_entries.items():
+                self.discovery_result.emit(f"<strong>Interface: {interface}</strong>")
+                for ip, mac, device_type in entries:
+                    self.discovery_result.emit(f"IP: <span style='color:blue;'>{ip}</span>, MAC: <span style='color:green;'>{mac}</span>, Device Type: {device_type}")
+        else:
+            self.discovery_result.emit(f"Error retrieving ARP table: {result.stderr.decode()}")
+
+    def get_device_type(self, mac):
+        """Get the device type based on the MAC address."""
+        try:
+            response = requests.get(f"https://api.maclookup.app/v2/macs/{mac}")
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("company", "Unknown")
+            else:
+                return "Unknown"
+        except Exception:
+            return "Unknown"
+
+class PingDiscoveryWorker(QtCore.QThread):
+    """Worker thread for ping discovery."""
+    discovery_result = pyqtSignal(str)
+
+    def __init__(self, ip_range):
+        super().__init__()
+        self.ip_range = ip_range
+        self.running = True
+
+    def run(self):
+        """Run the ping discovery worker thread."""
+        try:
+            network = ipaddress.IPv4Network(self.ip_range, strict=False)
+            for ip in network:
+                if not self.running:
+                    break
+                self.ping_discover(str(ip))
+        except Exception as e:
+            self.discovery_result.emit(f"Error discovering devices in range {self.ip_range}: {str(e)}")
+
+    def ping_discover(self, ip):
+        """Discover devices using ping."""
+        try:
+            response = subprocess.run(['ping', '-c', '1', ip], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if response.returncode == 0:
+                self.discovery_result.emit(f"Ping to {ip} successful\n{response.stdout.decode()}")
+            else:
+                self.discovery_result.emit(f"Ping to {ip} failed\n{response.stderr.decode()}")
+        except Exception as e:
+            self.discovery_result.emit(f"Error pinging {ip}: {str(e)}")
+
+    def stop(self):
+        """Stop the ping discovery worker thread."""
+        self.running = False
+
+class LLDPDiscoveryWorker(QtCore.QThread):
+    """Worker thread for LLDP discovery."""
+    discovery_result = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        """Run the LLDP discovery worker thread."""
+        try:
+            self.lldp_discover()
+        except Exception as e:
+            self.discovery_result.emit(f"Error discovering devices: {str(e)}")
+
+    def lldp_discover(self):
+        """Discover devices using LLDP."""
+        command = 'lldpctl'
+        result = subprocess.run(command.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output = result.stdout.decode()
+
+        if result.returncode == 0:
+            self.discovery_result.emit(output)
+        else:
+            self.discovery_result.emit(f"Error retrieving LLDP information: {result.stderr.decode()}")
+
+class CDPDiscoveryWorker(QtCore.QThread):
+    """Worker thread for CDP discovery."""
+    discovery_result = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        """Run the CDP discovery worker thread."""
+        try:
+            self.cdp_discover()
+        except Exception as e:
+            self.discovery_result.emit(f"Error discovering devices: {str(e)}")
+
+    def cdp_discover(self):
+        """Discover devices using CDP."""
+        command = 'cdpr'
+        result = subprocess.run(command.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output = result.stdout.decode()
+
+        if result.returncode == 0:
+            self.discovery_result.emit(output)
+        else:
+            self.discovery_result.emit(f"Error retrieving CDP information: {result.stderr.decode()}")
+
+class CommandLineEdit(QLineEdit):
+    """Custom QLineEdit for handling command history and auto-completion."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.history = []
+        self.history_index = -1
+        self.setPlaceholderText("Enter command...")
+
+    def keyPressEvent(self, event):
+        """Handle key press events for command history navigation and auto-completion."""
+        if event.key() == Qt.Key.Key_Up:
+            if self.history and self.history_index > 0:
+                self.history_index -= 1
+                self.setText(self.history[self.history_index])
+        elif event.key() == Qt.Key.Key_Down:
+            if self.history and self.history_index < len(self.history) - 1:
+                self.history_index += 1
+                self.setText(self.history[self.history_index])
+            elif self.history_index == len(self.history) - 1:
+                self.history_index += 1
+                self.clear()
+        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            command = self.text().strip()
+            if command:
+                self.history.append(command)
+                self.history_index = len(self.history)
+                self.clear()
+                self.parent().send_command(command)
+        else:
+            super().keyPressEvent(event)
+
+class NOCMgmtTool(QMainWindow):
+    """Main window for the NOC Management Tool."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("NOC-MGMT - Network Operations Manager")
+        self.setGeometry(100, 100, 1920, 1080)
+        
+        logging.basicConfig(filename="noc_mgmt.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout = QVBoxLayout(self.central_widget)
+        
+        self.header_layout = QHBoxLayout()
+        self.layout.addLayout(self.header_layout)
+
+        self.font_layout = QHBoxLayout()
+        self.header_layout.addLayout(self.font_layout)
+
+        self.font_layout.addWidget(QLabel("Font Type:"))
+        self.font_family = QComboBox()
+        self.font_family.addItems(["Arial", "Courier", "Helvetica", "Times"])
+        self.font_family.currentTextChanged.connect(self.update_font)
+        self.font_layout.addWidget(self.font_family)
+
+        self.font_layout.addWidget(QLabel("Font Size:"))
+        self.font_size_slider = QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.font_size_slider.setRange(8, 25)
+        self.font_size_slider.setValue(10)
+        self.font_size_slider.valueChanged.connect(self.update_font)
+        self.font_layout.addWidget(self.font_size_slider)
+
+        self.theme_button = QPushButton("🌙 Toggle Theme")
+        self.theme_button.clicked.connect(self.toggle_theme)
+        self.font_layout.addWidget(self.theme_button)
+
+        self.reset_button = QPushButton("🔄 Reset")
+        self.reset_button.clicked.connect(self.reset_to_default)
+        self.font_layout.addWidget(self.reset_button)
+
+        # Create tab widget
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet("QTabBar::tab { height: 30px; }")
+        self.layout.addWidget(self.tab_widget)
+
+        # SSH Tab
+        self.ssh_tab = QWidget()
+        self.tab_widget.addTab(self.ssh_tab, "SSH")
+        self.ssh_tab_layout = QVBoxLayout(self.ssh_tab)
+
+        # Main horizontal splitter for SSH tab
+        self.main_splitter = QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.main_splitter.setHandleWidth(5)
+        self.main_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: transparent;
+            }
+            QSplitter::handle:hover {
+                background-color: #888;
+                border: 1px solid #888;
+            }
+        """)
+        self.ssh_tab_layout.addWidget(self.main_splitter)
+
+        # Left vertical splitter for SSH tab
+        self.left_splitter = QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.left_splitter.setHandleWidth(5)
+        self.left_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: transparent;
+            }
+            QSplitter::handle:hover {
+                background-color: #888;
+                border: 1px solid #888;
+            }
+        """)
+        self.main_splitter.addWidget(self.left_splitter)
+
+        # Right vertical splitter for SSH tab
+        self.right_splitter = QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.right_splitter.setHandleWidth(5)
+        self.right_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: transparent;
+            }
+            QSplitter::handle:hover {
+                background-color: #888;
+                border: 1px solid #888;
+            }
+        """)
+        self.main_splitter.addWidget(self.right_splitter)
+
+        # SSH Credentials Frame with title
+        self.ssh_frame = QFrame()
+        self.ssh_layout = QVBoxLayout(self.ssh_frame)
+        self.left_splitter.addWidget(self.ssh_frame)
+        
+        self.ssh_title = QLabel("SSH Credentials")
+        self.ssh_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.ssh_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.ssh_layout.addWidget(self.ssh_title)
+
+        self.ssh_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.ssh_frame.setFrameShadow(QFrame.Shadow.Raised)
+        self.ssh_frame.setStyleSheet("""
+            QFrame {
+                border: 1px solid rgba(0, 0, 0, 0.2);
+            }
+        """)
+
+        self.ssh_scroll_area = QScrollArea()
+        self.ssh_scroll_area.setWidgetResizable(True)
+        self.ssh_scroll_content = QWidget()
+        self.ssh_scroll_content.setGeometry(0, 0, 400, 400)
+        self.ssh_scroll_layout = QGridLayout(self.ssh_scroll_content)
+        self.ssh_scroll_area.setWidget(self.ssh_scroll_content)
+        self.ssh_layout.addWidget(self.ssh_scroll_area)
+
+        self.ssh_scroll_layout.addWidget(QLabel("Username:"), 0, 0)
+        self.username_entry = QLineEdit()
+        self.ssh_scroll_layout.addWidget(self.username_entry, 0, 1)
+
+        self.ssh_scroll_layout.addWidget(QLabel("Password:"), 1, 0)
+        self.password_entry = QLineEdit()
+        self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ssh_scroll_layout.addWidget(self.password_entry, 1, 1)
+
+        self.ssh_scroll_layout.addWidget(QLabel("Enable Password:"), 2, 0)
+        self.enable_password_entry = QLineEdit()
+        self.enable_password_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ssh_scroll_layout.addWidget(self.enable_password_entry, 2, 1)
+
+        self.ssh_scroll_layout.addWidget(QLabel("SSH Port:"), 3, 0)
+        self.ssh_port_entry = QLineEdit("22")
+        self.ssh_scroll_layout.addWidget(self.ssh_port_entry, 3, 1)
+
+        self.ssh_scroll_layout.addWidget(QLabel("SSH Key File:"), 4, 0)
+        self.ssh_key_entry = QLineEdit()
+        self.ssh_scroll_layout.addWidget(self.ssh_key_entry, 4, 1)
+        self.browse_ssh_key_btn = QPushButton("Browse...")
+        self.browse_ssh_key_btn.clicked.connect(self.browse_ssh_key)
+        self.ssh_scroll_layout.addWidget(self.browse_ssh_key_btn, 4, 2)
+
+        # Checkbox to keep SSH session active
+        self.keep_active_checkbox = QCheckBox("Keep SSH Session Active")
+        self.ssh_scroll_layout.addWidget(self.keep_active_checkbox, 5, 0, 1, 2)
+
+        # Checkbox to enable interactive mode
+        self.interactive_checkbox = QCheckBox("Interactive Mode")
+        self.ssh_scroll_layout.addWidget(self.interactive_checkbox, 6, 0, 1, 2)
+
+        # IP Address Config Frame with title
+        self.ip_frame = QFrame()
+        self.ip_layout = QVBoxLayout(self.ip_frame)
+        self.left_splitter.addWidget(self.ip_frame)
+        
+        self.ip_title = QLabel("IP Address Config")
+        self.ip_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.ip_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.ip_layout.addWidget(self.ip_title)
+
+        self.ip_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.ip_frame.setFrameShadow(QFrame.Shadow.Raised)
+        self.ip_frame.setStyleSheet("""
+            QFrame {
+                border: 1px solid rgba(0, 0, 0, 0.2);
+            }
+        """)
+
+        self.ip_scroll_area = QScrollArea()
+        self.ip_scroll_area.setWidgetResizable(True)
+        self.ip_scroll_content = QWidget()
+        self.ip_scroll_content.setGeometry(0, 0, 400, 400)
+        self.ip_scroll_layout = QGridLayout(self.ip_scroll_content)
+        self.ip_scroll_area.setWidget(self.ip_scroll_content)
+        self.ip_layout.addWidget(self.ip_scroll_area)
+
+        self.ip_scroll_layout.addWidget(QLabel("IP List File:"), 0, 0)
+        self.ip_file_entry = QLineEdit()
+        self.ip_scroll_layout.addWidget(self.ip_file_entry, 0, 1)
+        self.browse_ip_file_btn = QPushButton("Browse...")
+        self.browse_ip_file_btn.clicked.connect(self.browse_ip_file)
+        self.ip_scroll_layout.addWidget(self.browse_ip_file_btn, 0, 2)
+
+        self.ip_scroll_layout.addWidget(QLabel("Exclude IPs (comma separated):"), 1, 0)
+        self.exclude_ips_entry = QLineEdit()
+        self.ip_scroll_layout.addWidget(self.exclude_ips_entry, 1, 1)
+
+        self.ip_scroll_layout.addWidget(QLabel("Command Delay (per sec):"), 2, 0)
+        self.command_delay_entry = QLineEdit("2")
+        self.ip_scroll_layout.addWidget(self.command_delay_entry, 2, 1)
+
+        # Command Configuration Frame
+        self.command_frame = QFrame()
+        self.command_layout = QVBoxLayout(self.command_frame)
+        self.left_splitter.addWidget(self.command_frame)
+        
+        self.command_title = QLabel("Command Line Simulator")
+        self.command_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.command_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-left: 10px;")
+        self.command_layout.addWidget(self.command_title)
+
+        self.command_text = QTextEdit()
+        self.command_layout.addWidget(self.command_text)
+
+        # Control Frame
+        self.control_frame = QFrame()
+        self.control_layout = QHBoxLayout(self.control_frame)
+        self.control_frame.setFixedHeight(50)
+        self.ssh_tab_layout.addWidget(self.control_frame)
+
+        self.control_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.control_frame.setFrameShadow(QFrame.Shadow.Raised)
+        self.control_frame.setStyleSheet("""
+            QFrame {
+                border: 1px solid rgba(0, 0, 0, 0.2);
+            }
+        """)
+
+        self.start_button = QPushButton("▶ Start Execution")
+        self.start_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.start_button.clicked.connect(self.start_execution)
+        self.control_layout.addWidget(self.start_button)
+
+        self.stop_button = QPushButton("■ Stop Execution")
+        self.stop_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.stop_button.setDisabled(True)
+        self.stop_button.clicked.connect(self.stop_execution)
+        self.control_layout.addWidget(self.stop_button)
+
+        self.save_button = QPushButton("💾 Save Output")
+        self.save_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.save_button.clicked.connect(self.save_output)
+        self.control_layout.addWidget(self.save_button)
+
+        self.save_template_button = QPushButton("💾 Save Config")
+        self.save_template_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.save_template_button.clicked.connect(self.save_template)
+        self.control_layout.addWidget(self.save_template_button)
+
+        self.load_template_button = QPushButton("📂 Load Config")
+        self.load_template_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.load_template_button.clicked.connect(self.load_template)
+        self.control_layout.addWidget(self.load_template_button)
+
+        self.progress = QProgressBar()
+        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.control_layout.addWidget(self.progress)
+        self.progress_label = QLabel("")
+        self.progress_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.control_layout.addWidget(self.progress_label)
+
+        self.how_to_use_button = QPushButton("❓ How to Use")
+        self.how_to_use_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.how_to_use_button.clicked.connect(self.show_how_to_use)
+        self.control_layout.addWidget(self.how_to_use_button)
+
+        self.made_by_button = QPushButton("By: Eng Thu-alfaqar")
+        self.made_by_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.made_by_button.clicked.connect(self.show_made_by)
+        self.control_layout.addWidget(self.made_by_button)
+
+        # Execution Window
+        self.execution_tab_widget = QTabWidget()
+        self.right_splitter.addWidget(self.execution_tab_widget)
+
+        self.footer_label = QLabel("© 2025 by Dhualfiqar")
+        self.ssh_tab_layout.addWidget(self.footer_label)
+
+        # Ping Tab
+        self.ping_tab = QWidget()
+        self.tab_widget.addTab(self.ping_tab, "Ping")
+        self.ping_tab_layout = QVBoxLayout(self.ping_tab)
+
+        self.ping_title = QLabel("Ping Results")
+        self.ping_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.ping_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-left: 10px;")
+        self.ping_tab_layout.addWidget(self.ping_title)
+
+        self.ping_text = QTextEdit()
+        self.ping_tab_layout.addWidget(self.ping_text)
+
+        # Search Bar for Ping Tab
+        self.ping_search_layout = QHBoxLayout()
+        self.ping_search_input = QLineEdit()
+        self.ping_search_input.setPlaceholderText("Search Ping Results...")
+        self.ping_search_input.textChanged.connect(self.search_ping_output)
+        self.ping_search_layout.addWidget(self.ping_search_input)
+        self.ping_tab_layout.addLayout(self.ping_search_layout)
+
+        self.ping_controls_layout = QHBoxLayout()
+        self.ping_tab_layout.addLayout(self.ping_controls_layout)
+        self.ping_button = QPushButton("🔄 Start Ping")
+        self.ping_button.setFixedSize(150, 40)
+        self.ping_button.clicked.connect(self.start_ping)
+        self.ping_controls_layout.addWidget(self.ping_button)
+
+        self.ping_stop_button = QPushButton("■ Stop Ping")
+        self.ping_stop_button.setFixedSize(150, 40)
+        self.ping_stop_button.clicked.connect(self.stop_ping)
+        self.ping_controls_layout.addWidget(self.ping_stop_button)
+
+        self.continuous_ping_checkbox = QCheckBox("Continuous Ping")
+        self.ping_controls_layout.addWidget(self.continuous_ping_checkbox)
+
+        self.ping_count_checkbox = QCheckBox("Specify Ping Count")
+        self.ping_count_checkbox.stateChanged.connect(self.toggle_ping_count)
+        self.ping_controls_layout.addWidget(self.ping_count_checkbox)
+
+        self.ping_count_label = QLabel("Ping Count:")
+        self.ping_controls_layout.addWidget(self.ping_count_label)
+
+        self.ping_count_spinbox = QSpinBox()
+        self.ping_count_spinbox.setRange(1, 100)
+        self.ping_count_spinbox.setValue(4)
+        self.ping_controls_layout.addWidget(self.ping_count_spinbox)
+
+        self.ping_count_label.setDisabled(True)
+        self.ping_count_spinbox.setDisabled(True)
+
+        # Traceroute Tab
+        self.traceroute_tab = QWidget()
+        self.tab_widget.addTab(self.traceroute_tab, "Traceroute")
+        self.traceroute_tab_layout = QVBoxLayout(self.traceroute_tab)
+
+        self.traceroute_title = QLabel("Traceroute Results")
+        self.traceroute_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.traceroute_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-left: 10px;")
+        self.traceroute_tab_layout.addWidget(self.traceroute_title)
+
+        self.traceroute_text = QTextEdit()
+        self.traceroute_tab_layout.addWidget(self.traceroute_text)
+
+        # Search Bar for Traceroute Tab
+        self.traceroute_search_layout = QHBoxLayout()
+        self.traceroute_search_input = QLineEdit()
+        self.traceroute_search_input.setPlaceholderText("Search Traceroute Results...")
+        self.traceroute_search_input.textChanged.connect(self.search_traceroute_output)
+        self.traceroute_search_layout.addWidget(self.traceroute_search_input)
+        self.traceroute_tab_layout.addLayout(self.traceroute_search_layout)
+
+        self.traceroute_controls_layout = QHBoxLayout()
+        self.traceroute_tab_layout.addLayout(self.traceroute_controls_layout)
+        self.traceroute_button = QPushButton("🔄 Start Traceroute")
+        self.traceroute_button.setFixedSize(150, 40)
+        self.traceroute_button.clicked.connect(self.start_traceroute)
+        self.traceroute_controls_layout.addWidget(self.traceroute_button)
+
+        self.traceroute_stop_button = QPushButton("■ Stop Traceroute")
+        self.traceroute_stop_button.setFixedSize(150, 40)
+        self.traceroute_stop_button.clicked.connect(self.stop_traceroute)
+        self.traceroute_controls_layout.addWidget(self.traceroute_stop_button)
+
+        self.traceroute_hops_label = QLabel("Max Hops:")
+        self.traceroute_controls_layout.addWidget(self.traceroute_hops_label)
+
+        self.traceroute_hops_spinbox = QSpinBox()
+        self.traceroute_hops_spinbox.setRange(1, 100)
+        self.traceroute_hops_spinbox.setValue(30)
+        self.traceroute_controls_layout.addWidget(self.traceroute_hops_spinbox)
+
+        # Discovery Tab
+        self.discovery_tab = QWidget()
+        self.tab_widget.addTab(self.discovery_tab, "Discovery")
+        self.discovery_tab_layout = QVBoxLayout(self.discovery_tab)
+
+        self.discovery_title = QLabel("Network Device Discovery")
+        self.discovery_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.discovery_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-left: 10px;")
+        self.discovery_tab_layout.addWidget(self.discovery_title)
+
+        self.discovery_controls_layout = QHBoxLayout()
+        self.discovery_tab_layout.addLayout(self.discovery_controls_layout)
+
+        self.discovery_controls_layout.addWidget(QLabel("Discovery Method:"))
+        self.discovery_method_combo = QComboBox()
+        self.discovery_method_combo.addItems(["ARP", "Ping", "LLDP", "CDP"])
+        self.discovery_controls_layout.addWidget(self.discovery_method_combo)
+
+        self.discovery_button = QPushButton("🔄 Start Discovery")
+        self.discovery_button.setFixedSize(150, 40)
+        self.discovery_button.clicked.connect(self.start_discovery)
+        self.discovery_controls_layout.addWidget(self.discovery_button)
+
+        self.discovery_stop_button = QPushButton("■ Stop Discovery")
+        self.discovery_stop_button.setFixedSize(150, 40)
+        self.discovery_stop_button.clicked.connect(self.stop_discovery)
+        self.discovery_controls_layout.addWidget(self.discovery_stop_button)
+
+        self.discovery_text = QTextEdit()
+        self.discovery_tab_layout.addWidget(self.discovery_text)
+
+        # Search Bar for Discovery Tab
+        self.discovery_search_layout = QHBoxLayout()
+        self.discovery_search_input = QLineEdit()
+        self.discovery_search_input.setPlaceholderText("Search Discovery Results...")
+        self.discovery_search_input.textChanged.connect(self.search_discovery_output)
+        self.discovery_search_layout.addWidget(self.discovery_search_input)
+        self.discovery_tab_layout.addLayout(self.discovery_search_layout)
+
+        self.running = False
+
+        self.workers = {}
+
+        self.is_dark_mode = False
+        self.update_theme()
+
+        # Command history
+        self.command_history = []
+
+    def browse_ssh_key(self):
+        """Browse for SSH key file."""
+        filename, _ = QFileDialog.getOpenFileName(self, "Select SSH Key File", "", "PEM Files (*.pem);;All Files (*)")
+        if filename:
+            self.ssh_key_entry.setText(filename)
+
+    def browse_ip_file(self):
+        """Browse for IP list file."""
+        filename, _ = QFileDialog.getOpenFileName(self, "Select IP List File", "", "Text Files (*.txt);;All Files (*)")
+        if filename:
+            self.ip_file_entry.setText(filename)
+
+    def start_execution(self):
+        """Start executing SSH commands."""
+        commands = self.command_text.toPlainText().strip().splitlines()
+        if not commands and not self.interactive_checkbox.isChecked():
+            QMessageBox.warning(self, "No Commands", "Please enter at least one command.")
+            return
+
+        self.running = True
+        self.start_button.setDisabled(True)
+        self.stop_button.setDisabled(False)
+        self.progress_label.setText("Starting Execution...")
+
+        username = self.username_entry.text()
+        password = self.password_entry.text()
+        enable_password = self.enable_password_entry.text()
+        ssh_key_file = self.ssh_key_entry.text()
+
+        ip_file = self.ip_file_entry.text()
+        exclude_ips = [ip.strip() for ip in self.exclude_ips_entry.text().split(",") if ip.strip()]
+        try:
+            with open(ip_file, "r") as file:
+                ips = [line.strip() for line in file.readlines() if line.strip() and line.strip() not in exclude_ips]
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read IPs from file: {str(e)}")
+            return
+
+        command_delay = int(self.command_delay_entry.text())
+        keep_active = self.keep_active_checkbox.isChecked()
+        interactive = self.interactive_checkbox.isChecked()
+
+        for ip in ips:
+            worker = Worker(ip, username, password, enable_password, ssh_key_file, commands, command_delay, keep_active, interactive)
+            worker.progress.connect(self.update_progress)
+            worker.finished.connect(self.execution_finished)
+            worker.data_received.connect(self.update_output)
+            worker.start()
+            self.workers[ip] = worker
+
+            # Create tabs for each IP if it does not already exist
+            if not self.execution_tab_widget.findChild(QWidget, f"text_edit_{ip}"):
+                tab = QWidget()
+                layout = QVBoxLayout(tab)
+                text_edit = QTextEdit()
+                text_edit.setFont(QtGui.QFont(self.font_family.currentText(), self.font_size_slider.value()))
+                text_edit.setObjectName(f"text_edit_{ip}")
+                layout.addWidget(text_edit)
+
+                # Add command input and send button for interactive mode
+                if interactive:
+                    command_input_layout = QHBoxLayout()
+                    command_input = CommandLineEdit()
+                    command_input.setFont(QtGui.QFont(self.font_family.currentText(), self.font_size_slider.value()))
+                    command_input.setObjectName(f"command_input_{ip}")
+                    command_input.returnPressed.connect(lambda ip=ip: self.send_interactive_command(ip))
+                    send_button = QPushButton("Send")
+                    send_button.setFont(QtGui.QFont(self.font_family.currentText(), self.font_size_slider.value()))
+                    send_button.setObjectName(f"send_button_{ip}")
+                    send_button.clicked.connect(lambda _, ip=ip: self.send_interactive_command(ip))
+                    command_input_layout.addWidget(command_input)
+                    command_input_layout.addWidget(send_button)
+                    layout.addLayout(command_input_layout)
+
+                self.execution_tab_widget.addTab(tab, ip)
+
+        # Store commands in history
+        self.command_history.extend(commands)
+
+    def stop_execution(self):
+        """Stop executing SSH commands."""
+        for worker in self.workers.values():
+            worker.close_connections()
+            worker.terminate()
+        self.workers.clear()
+        self.running = False
+        self.start_button.setDisabled(False)
+        self.stop_button.setDisabled(True)
+        self.progress_label.setText("Execution Stopped")
+
+    def send_interactive_command(self, ip):
+        """Send an interactive command."""
+        command_input = self.findChild(CommandLineEdit, f"command_input_{ip}")
+        command = command_input.text().strip()
+        if command and self.workers:
+            self.workers[ip].send_command(command)
+            command_input.clear()
+            # Update command history
+            self.command_history.append(command)
+
+    def update_progress(self, ip, output):
+        """Update the progress bar and output."""
+        text_edit = self.execution_tab_widget.findChild(QTextEdit, f"text_edit_{ip}")
+        if text_edit:
+            text_edit.append(output)
+
+    def update_output(self, ip, data):
+        """Update the output text."""
+        text_edit = self.execution_tab_widget.findChild(QTextEdit, f"text_edit_{ip}")
+        if text_edit:
+            text_edit.append(data)
+
+    def execution_finished(self, ip):
+        """Handle the completion of command execution."""
+        if ip in self.workers:
+            del self.workers[ip]
+
+        if not self.workers:
+            self.running = False
+            self.start_button.setDisabled(False)
+            self.stop_button.setDisabled(True)
+            self.progress_label.setText("Execution Finished")
+
+    def save_output(self):
+        """Save the output to a file."""
+        file, _ = QFileDialog.getSaveFileName(self, "Save Output", "", "Text Files (*.txt);;All Files (*)")
+        if file:
+            with open(file, "w") as f:
+                index = self.execution_tab_widget.currentIndex()
+                if index != -1:
+                    text_edit = self.execution_tab_widget.widget(index).findChild(QTextEdit)
+                    f.write(text_edit.toPlainText())
+
+    def save_template(self):
+        """Save the command configuration to a file."""
+        file, _ = QFileDialog.getSaveFileName(self, "Save Config", "", "JSON Files (*.json);;All Files (*)")
+        if file:
+            data = {
+                "commands": self.command_text.toPlainText().strip().splitlines()
+            }
+            with open(file, "w") as f:
+                json.dump(data, f)
+
+    def load_template(self):
+        """Load the command configuration from a file."""
+        file, _ = QFileDialog.getOpenFileName(self, "Load Config", "", "JSON Files (*.json);;All Files (*)")
+        if file:
+            with open(file, "r") as f:
+                data = json.load(f)
+                self.command_text.setPlainText("\n".join(data.get("commands", [])))
+
+    def toggle_theme(self):
+        """Toggle between light and dark theme."""
+        self.is_dark_mode = not self.is_dark_mode
+        self.update_theme()
+
+    def update_theme(self):
+        """Update the application theme."""
+        if self.is_dark_mode:
+            self.setStyleSheet("""
+                QWidget {
+                    background-color: #2E3440;
+                    color: #D8DEE9;
+                }
+                QLabel, QLineEdit, QComboBox, QSlider, QPushButton, QTextEdit, QProgressBar, QCheckBox, QTabWidget::pane, QTabBar::tab {
+                    background-color: #3B4252;
+                    color: #D8DEE9;
+                    border: 1px solid #4C566A;
+                }
+                QPushButton {
+                    background-color: #4C566A;
+                }
+                QProgressBar {
+                    background-color: #4C566A;
+                    border: 1px solid #D8DEE9;
+                    text-align: center;
+                }
+                QProgressBar::chunk {
+                    background-color: #88C0D0;
+                }
+                QScrollArea {
+                    background-color: #2E3440;
+                }
+                QSplitter::handle {
+                    background-color: transparent;
+                }
+                QSplitter::handle:hover {
+                    background-color: #888;
+                    border: 1px solid #888;
+                }
+                QSlider::groove:horizontal {
+                    border: 1px solid #bbb;
+                    background: #eee;
+                    height: 10px;
+                    border-radius: 4px;
+                }
+                QSlider::handle:horizontal {
+                    background: #5c5c5c;
+                    border: 1px solid #5c5c5c;
+                    width: 18px;
+                    margin: -5px 0;
+                    border-radius: 9px;
+                }
+                QSlider::handle:horizontal:hover {
+                    background: #3ec6ff;
+                    border: 1px solid #3ec6ff;
+                }
+            """)
+        else:
+            self.setStyleSheet("")
+
+    def reset_to_default(self):
+        """Reset font settings to default."""
+        self.font_family.setCurrentText("Arial")
+        self.font_size_slider.setValue(10)
+        self.is_dark_mode = False
+        self.update_theme()
+
+    def update_font(self):
+        """Update the font settings."""
+        font = QtGui.QFont(self.font_family.currentText(), self.font_size_slider.value())
+        self.setFont(font)
+        for text_edit in self.findChildren(QTextEdit):
+            text_edit.setFont(font)
+        for line_edit in self.findChildren(QLineEdit):
+            line_edit.setFont(font)
+        for combo_box in self.findChildren(QComboBox):
+            combo_box.setFont(font)
+        for button in self.findChildren(QPushButton):
+            button.setFont(font)
+        for check_box in self.findChildren(QCheckBox):
+            check_box.setFont(font)
+        for tab_widget in self.findChildren(QTabWidget):
+            tab_widget.setFont(font)
+        for spin_box in self.findChildren(QSpinBox):
+            spin_box.setFont(font)
+
+    def show_how_to_use(self):
+        """Show the How to Use message box."""
+        QMessageBox.information(self, "How to Use", "Instructions on how to use the NOC Management Tool...")
+
+    def show_made_by(self):
+        """Show the Made By message box."""
+        QMessageBox.information(self, "By: Eng Thu-alfaqar", "This tool was created by Eng Thu-alfaqar.")
+
+    def search_ping_output(self):
+        """Search the ping output."""
+        search_text = self.ping_search_input.text().strip()
+        ping_results = self.ping_text.toPlainText().splitlines()
+        filtered_results = [line for line in ping_results if search_text.lower() in line.lower()]
+        self.ping_text.setPlainText("\n".join(filtered_results))
+
+    def search_traceroute_output(self):
+        """Search the traceroute output."""
+        search_text = self.traceroute_search_input.text().strip()
+        traceroute_results = self.traceroute_text.toPlainText().splitlines()
+        filtered_results = [line for line in traceroute_results if search_text.lower() in line.lower()]
+        self.traceroute_text.setPlainText("\n".join(filtered_results))
+
+    def search_discovery_output(self):
+        """Search the discovery output."""
+        search_text = self.discovery_search_input.text().strip()
+        discovery_results = self.discovery_text.toPlainText().splitlines()
+        filtered_results = [line for line in discovery_results if search_text.lower() in line.lower()]
+        self.discovery_text.setPlainText("\n".join(filtered_results))
+
+    def toggle_ping_count(self):
+        """Toggle the ping count spinbox."""
+        if self.ping_count_checkbox.isChecked():
+            self.ping_count_label.setDisabled(False)
+            self.ping_count_spinbox.setDisabled(False)
+        else:
+            self.ping_count_label.setDisabled(True)
+            self.ping_count_spinbox.setDisabled(True)
+
+    def start_ping(self):
+        """Start the ping process."""
+        ips = self.command_text.toPlainText().strip().splitlines()
+        continuous = self.continuous_ping_checkbox.isChecked()
+        count = self.ping_count_spinbox.value() if self.ping_count_checkbox.isChecked() else 4
+        self.ping_worker = PingWorker(ips, continuous, count)
+        self.ping_worker.ping_result.connect(self.update_ping_output)
+        self.ping_worker.start()
+
+    def stop_ping(self):
+        """Stop the ping process."""
+        if self.ping_worker:
+            self.ping_worker.stop()
+
+    def update_ping_output(self, result):
+        """Update the ping output."""
+        self.ping_text.append(result)
+
+    def start_traceroute(self):
+        """Start the traceroute process."""
+        ip = self.command_text.toPlainText().strip()
+        max_hops = self.traceroute_hops_spinbox.value()
+        self.traceroute_worker = TracerouteWorker(ip, max_hops)
+        self.traceroute_worker.traceroute_result.connect(self.update_traceroute_output)
+        self.traceroute_worker.start()
+
+    def stop_traceroute(self):
+        """Stop the traceroute process."""
+        if self.traceroute_worker:
+            self.traceroute_worker.stop()
+
+    def update_traceroute_output(self, result):
+        """Update the traceroute output."""
+        self.traceroute_text.append(result)
+
+    def start_discovery(self):
+        """Start the discovery process."""
+        method = self.discovery_method_combo.currentText()
+        if method == "ARP":
+            self.discovery_worker = ARPDiscoveryWorker()
+        elif method == "Ping":
+            ip_range = self.command_text.toPlainText().strip()
+            self.discovery_worker = PingDiscoveryWorker(ip_range)
+        elif method == "LLDP":
+            self.discovery_worker = LLDPDiscoveryWorker()
+        elif method == "CDP":
+            self.discovery_worker = CDPDiscoveryWorker()
+        self.discovery_worker.discovery_result.connect(self.update_discovery_output)
+        self.discovery_worker.start()
+
+    def stop_discovery(self):
+        """Stop the discovery process."""
+        if self.discovery_worker:
+            self.discovery_worker.stop()
+
+    def update_discovery_output(self, result):
+        """Update the discovery output."""
+        self.discovery_text.append(result)
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = NOCMgmtTool()
+    window.show()
+    sys.exit(app.exec())
