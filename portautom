@@ -1,0 +1,265 @@
+import sys
+from netmiko import ConnectHandler
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton, QLabel, QLineEdit, QMessageBox, QTextEdit
+)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
+
+
+class NetmikoThread(QThread):
+    output_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, host, username, password, commands, config_mode=False):
+        super().__init__()
+        self.host = host
+        self.username = username
+        self.password = password
+        self.commands = commands
+        self.config_mode = config_mode
+
+    def run(self):
+        try:
+            device = {
+                'device_type': 'cisco_ios',
+                'ip': self.host,
+                'username': self.username,
+                'password': self.password,
+                'timeout': 20,
+            }
+            connection = ConnectHandler(**device)
+            output = ""
+            prompt = connection.find_prompt()
+            print(f"Detected prompt: {prompt}")
+
+            if self.config_mode:
+                connection.enable()
+                output += connection.send_config_set(self.commands, enter_config_mode=True, exit_config_mode=True)
+            else:
+                for command in self.commands:
+                    output += connection.send_command(command, delay_factor=3, expect_string=r'.*#')
+                    output += "\n"
+
+            connection.disconnect()
+            self.output_signal.emit(output)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class CiscoInterfaceControl(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('Cisco Interface & VLAN Control')
+        self.setGeometry(100, 100, 400, 450)
+
+        layout = QVBoxLayout()
+
+        self.hostInput = QLineEdit(self)
+        self.hostInput.setPlaceholderText('Enter Switch IP')
+        layout.addWidget(self.hostInput)
+
+        self.usernameInput = QLineEdit(self)
+        self.usernameInput.setPlaceholderText('Enter Username')
+        layout.addWidget(self.usernameInput)
+
+        self.passwordInput = QLineEdit(self)
+        self.passwordInput.setPlaceholderText('Enter Password')
+        self.passwordInput.setEchoMode(QLineEdit.Password)
+        layout.addWidget(self.passwordInput)
+
+        self.fetchButton = QPushButton('Fetch Interfaces', self)
+        self.fetchButton.clicked.connect(self.fetch_interfaces)
+        layout.addWidget(self.fetchButton)
+
+        self.interfaceLabel = QLabel('Select Interface:', self)
+        layout.addWidget(self.interfaceLabel)
+        self.interfaceCombo = QComboBox(self)
+        layout.addWidget(self.interfaceCombo)
+
+        self.interfaceDetails = QTextEdit(self)
+        self.interfaceDetails.setReadOnly(True)
+        layout.addWidget(self.interfaceDetails)
+
+        buttonLayout = QHBoxLayout()
+        self.upButton = QPushButton('Bring Interface Up', self)
+        self.upButton.clicked.connect(self.bring_interface_up)
+        buttonLayout.addWidget(self.upButton)
+
+        self.downButton = QPushButton('Bring Interface Down', self)
+        self.downButton.clicked.connect(self.bring_interface_down)
+        buttonLayout.addWidget(self.downButton)
+        layout.addLayout(buttonLayout)
+
+        vlanLayout = QHBoxLayout()
+        self.vlanInput = QLineEdit(self)
+        self.vlanInput.setPlaceholderText('Enter VLAN ID')
+        vlanLayout.addWidget(self.vlanInput)
+
+        self.vlanButton = QPushButton('Change VLAN', self)
+        self.vlanButton.clicked.connect(self.change_vlan)
+        vlanLayout.addWidget(self.vlanButton)
+        layout.addLayout(vlanLayout)
+
+        modeLayout = QVBoxLayout()
+        modeSelectLayout = QHBoxLayout()
+        self.modeCombo = QComboBox(self)
+        self.modeCombo.addItems(['Access', 'Trunk'])
+        modeSelectLayout.addWidget(QLabel('Select Mode:'))
+        modeSelectLayout.addWidget(self.modeCombo)
+        modeLayout.addLayout(modeSelectLayout)
+
+        self.modeButton = QPushButton('Set Mode', self)
+        self.modeButton.clicked.connect(self.change_mode)
+        modeLayout.addWidget(self.modeButton)
+
+        allowedVlanLayout = QHBoxLayout()
+        self.allowedVlansInput = QLineEdit(self)
+        self.allowedVlansInput.setPlaceholderText('Enter Allowed VLANs (comma-separated)')
+        allowedVlanLayout.addWidget(self.allowedVlansInput)
+
+        self.allowedVlansButton = QPushButton('Set Allowed VLANs', self)
+        self.allowedVlansButton.clicked.connect(self.set_allowed_vlans)
+        allowedVlanLayout.addWidget(self.allowedVlansButton)
+
+        modeLayout.addLayout(allowedVlanLayout)
+        layout.addLayout(modeLayout)
+
+        self.setLayout(layout)
+
+    def fetch_interfaces(self):
+        host = self.hostInput.text().strip()
+        username = self.usernameInput.text().strip()
+        password = self.passwordInput.text().strip()
+
+        if not host or not username or not password:
+            QMessageBox.warning(self, 'Input Error', 'Please enter all SSH credentials.')
+            return
+
+        commands = ['show interface description']
+        self.netmiko_thread = NetmikoThread(host, username, password, commands)
+        self.netmiko_thread.output_signal.connect(self.update_interfaces)
+        self.netmiko_thread.error_signal.connect(self.show_error)
+        self.netmiko_thread.start()
+
+    def update_interfaces(self, output):
+        interfaces = []
+        interface_details = {}
+        for line in output.splitlines():
+            if line.startswith(('Gi', 'Fa', 'Eth')):
+                parts = line.split()
+                if parts:
+                    interface = parts[0]
+                    description = ' '.join(parts[1:])
+                    interfaces.append(f"{interface} - {description}")
+                    interface_details[interface] = description
+
+        if not interfaces:
+            QMessageBox.warning(self, 'No Interfaces', 'No interfaces found.')
+            return
+
+        self.interfaceCombo.clear()
+        self.interfaceCombo.addItems(interfaces)
+        self.interfaceCombo.currentTextChanged.connect(lambda: self.display_interface_details(interface_details))
+
+    def display_interface_details(self, interface_details):
+        selected_text = self.interfaceCombo.currentText()
+        interface = selected_text.split(' - ')[0]
+        details = interface_details.get(interface, 'No details available')
+        self.interfaceDetails.setPlainText(f"Interface: {interface}\nDescription: {details}")
+
+    def bring_interface_up(self):
+        self.change_interface_state('no shutdown')
+
+    def bring_interface_down(self):
+        self.change_interface_state('shutdown')
+
+    def change_interface_state(self, state_command):
+        host = self.hostInput.text().strip()
+        username = self.usernameInput.text().strip()
+        password = self.passwordInput.text().strip()
+        selected_text = self.interfaceCombo.currentText()
+        interface = selected_text.split(' - ')[0]
+
+        if not host or not username or not password or not interface:
+            QMessageBox.warning(self, 'Input Error', 'Ensure all fields are filled.')
+            return
+
+        commands = [f'interface {interface}', state_command]
+        self.netmiko_thread = NetmikoThread(host, username, password, commands, config_mode=True)
+        self.netmiko_thread.output_signal.connect(self.show_success)
+        self.netmiko_thread.error_signal.connect(self.show_error)
+        self.netmiko_thread.start()
+
+    def change_vlan(self):
+        host = self.hostInput.text().strip()
+        username = self.usernameInput.text().strip()
+        password = self.passwordInput.text().strip()
+        selected_text = self.interfaceCombo.currentText()
+        interface = selected_text.split(' - ')[0]
+        vlan_id = self.vlanInput.text().strip()
+
+        if not host or not username or not password or not interface or not vlan_id:
+            QMessageBox.warning(self, 'Input Error', 'Ensure all fields are filled.')
+            return
+
+        commands = [f'interface {interface}', f'switchport access vlan {vlan_id}']
+        self.netmiko_thread = NetmikoThread(host, username, password, commands, config_mode=True)
+        self.netmiko_thread.output_signal.connect(self.show_success)
+        self.netmiko_thread.error_signal.connect(self.show_error)
+        self.netmiko_thread.start()
+
+    def change_mode(self):
+        host = self.hostInput.text().strip()
+        username = self.usernameInput.text().strip()
+        password = self.passwordInput.text().strip()
+        selected_text = self.interfaceCombo.currentText()
+        interface = selected_text.split(' - ')[0]
+        mode = self.modeCombo.currentText().lower()
+
+        if not host or not username or not password or not interface:
+            QMessageBox.warning(self, 'Input Error', 'Ensure all fields are filled.')
+            return
+
+        commands = [f'interface {interface}']
+        if mode == 'trunk':
+            commands.append('switchport trunk encapsulation dot1q')
+        commands.append(f'switchport mode {mode}')
+
+        self.netmiko_thread = NetmikoThread(host, username, password, commands, config_mode=True)
+        self.netmiko_thread.output_signal.connect(self.show_success)
+        self.netmiko_thread.error_signal.connect(self.show_error)
+        self.netmiko_thread.start()
+
+    def set_allowed_vlans(self):
+        host = self.hostInput.text().strip()
+        username = self.usernameInput.text().strip()
+        password = self.passwordInput.text().strip()
+        selected_text = self.interfaceCombo.currentText()
+        interface = selected_text.split(' - ')[0]
+        allowed_vlans = self.allowedVlansInput.text().strip()
+
+        if not host or not username or not password or not interface or not allowed_vlans:
+            QMessageBox.warning(self, 'Input Error', 'Ensure all fields are filled.')
+            return
+
+        commands = [f'interface {interface}', f'switchport trunk allowed vlan {allowed_vlans}']
+        self.netmiko_thread = NetmikoThread(host, username, password, commands, config_mode=True)
+        self.netmiko_thread.output_signal.connect(self.show_success)
+        self.netmiko_thread.error_signal.connect(self.show_error)
+        self.netmiko_thread.start()
+
+    def show_success(self, output):
+        QMessageBox.information(self, 'Success', f'Operation completed successfully.\nOutput:\n{output}')
+
+    def show_error(self, error):
+        QMessageBox.critical(self, 'Error', f'Command failed.\nError: {error}')
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    ex = CiscoInterfaceControl()
+    ex.show()
+    sys.exit(app.exec_())
