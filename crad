@@ -1,0 +1,652 @@
+import sys
+import logging
+from functools import partial
+from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton,
+    QLabel, QLineEdit, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
+)
+from PyQt6.QtGui import QColor, QPalette, QBrush
+from netmiko import ConnectHandler
+
+# ------------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# ------------------------------------------------------------------------
+logging.basicConfig(
+    filename='network_manager.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+class NetmikoThread(QThread):
+    """
+    QThread used to avoid blocking the GUI while sending commands to the device.
+    
+    NOTE: Removed custom 'expect_string' usage when sending exec-mode commands
+    to prevent prompt matching issues. This helps avoid potential hangs if
+    the device prompt doesn't match the pattern.
+    """
+    output_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, host, username, password, commands, config_mode=False):
+        super().__init__()
+        self.host = host
+        self.username = username
+        self.password = password
+        self.commands = commands
+        self.config_mode = config_mode
+
+    def run(self):
+        try:
+            connection = self.connect_to_device()
+            output = self.send_commands(connection)
+            connection.disconnect()  # Cleanly close connection
+            self.output_signal.emit(output)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+    def connect_to_device(self):
+        """
+        Establish a Netmiko SSH connection to the device with optional enable/config mode.
+        Return an active connection or raise an exception if it fails.
+        """
+        try:
+            device_params = {
+                'device_type': 'cisco_ios',
+                'ip': self.host,
+                'username': self.username,
+                'password': self.password,
+                'timeout': 20,
+                'banner_timeout': 30,
+                'conn_timeout': 30,
+                'auth_timeout': 10
+            }
+            connection = ConnectHandler(**device_params)
+            if self.config_mode:
+                connection.enable()
+            return connection
+        except Exception as e:
+            logging.error(f"Failed to connect to device {self.host}: {e}")
+            raise
+
+    def send_commands(self, connection):
+        """
+        Send commands to the device in either config or exec mode.
+        Return the combined output string from all commands.
+        
+        NOTE: The default Netmiko prompt match is used to avoid potential hanging behavior.
+        """
+        output = ""
+        try:
+            if self.config_mode:
+                output += connection.send_config_set(
+                    self.commands,
+                    enter_config_mode=True,
+                    exit_config_mode=True
+                )
+            else:
+                for cmd in self.commands:
+                    # Removed 'expect_string' to let Netmiko handle prompt detection automatically.
+                    output += connection.send_command(cmd, delay_factor=3)
+                    output += "\n"
+        except Exception as e:
+            logging.error(f"Error sending commands {self.commands}: {e}")
+            raise
+        return output
+
+class CiscoInterfaceControl(QWidget):
+    """
+    Main PyQt application window controlling Cisco interfaces via Netmiko.
+    """
+    def __init__(self):
+        super().__init__()
+        self.dark_mode_enabled = False
+
+        # Data structures for storing interface info
+        self.interface_status = {}
+        self.interface_switchport = {}
+        self.interface_description = {}
+        self.vlan_info = {}
+
+        self.initUI()
+
+    def initUI(self):
+        """
+        Sets up the PyQt UI.
+        """
+        self.setWindowTitle('Cisco Interface & VLAN Control - Single File')
+        self.setGeometry(100, 100, 1200, 800)
+        layout = QVBoxLayout()
+
+        # Credential inputs
+        self.hostInput = QLineEdit(self)
+        self.hostInput.setPlaceholderText('Enter Switch IP')
+        layout.addWidget(self.hostInput)
+
+        self.usernameInput = QLineEdit(self)
+        self.usernameInput.setPlaceholderText('Enter Username')
+        layout.addWidget(self.usernameInput)
+
+        self.passwordInput = QLineEdit(self)
+        self.passwordInput.setPlaceholderText('Enter Password')
+        self.passwordInput.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self.passwordInput)
+
+        # Buttons for fetch, refresh, toggle dark mode
+        buttonLayout = QHBoxLayout()
+        self.fetchButton = QPushButton('Fetch Interfaces', self)
+        self.fetchButton.clicked.connect(self.fetch_interfaces)
+        buttonLayout.addWidget(self.fetchButton)
+
+        self.refreshButton = QPushButton('Refresh Interfaces', self)
+        self.refreshButton.clicked.connect(self.fetch_interfaces)
+        buttonLayout.addWidget(self.refreshButton)
+
+        self.darkModeButton = QPushButton('Toggle Dark Mode', self)
+        self.darkModeButton.clicked.connect(self.toggle_dark_mode)
+        buttonLayout.addWidget(self.darkModeButton)
+        layout.addLayout(buttonLayout)
+
+        # Table for interfaces
+        self.interfaceTable = QTableWidget(self)
+        self.interfaceTable.setColumnCount(8)
+        self.interfaceTable.setHorizontalHeaderLabels([
+            'Select', 'Interface', 'Description', 'Mode', 'VLAN', 'Status', 'Bring Up', 'Bring Down'
+        ])
+        self.interfaceTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.interfaceTable)
+
+        # Bulk VLAN operation
+        bulkOperationLayout = QHBoxLayout()
+        self.bulkVlanInput = QLineEdit(self)
+        self.bulkVlanInput.setPlaceholderText('Enter VLAN ID for Bulk Operation')
+        bulkOperationLayout.addWidget(self.bulkVlanInput)
+
+        self.bulkVlanButton = QPushButton('Bulk Change VLAN', self)
+        self.bulkVlanButton.clicked.connect(self.bulk_change_vlan)
+        bulkOperationLayout.addWidget(self.bulkVlanButton)
+
+        # Bulk mode operation
+        self.bulkModeCombo = QComboBox(self)
+        self.bulkModeCombo.addItems(['Access', 'Trunk'])
+        bulkOperationLayout.addWidget(QLabel('Bulk Set Mode:'))
+        bulkOperationLayout.addWidget(self.bulkModeCombo)
+
+        self.bulkModeButton = QPushButton('Bulk Set Mode', self)
+        self.bulkModeButton.clicked.connect(self.bulk_set_mode)
+        bulkOperationLayout.addWidget(self.bulkModeButton)
+        layout.addLayout(bulkOperationLayout)
+
+        # Change description
+        descLayout = QHBoxLayout()
+        self.descInput = QLineEdit(self)
+        self.descInput.setPlaceholderText('Enter Description')
+        descLayout.addWidget(self.descInput)
+
+        self.descButton = QPushButton('Change Description', self)
+        self.descButton.clicked.connect(self.change_description)
+        descLayout.addWidget(self.descButton)
+        layout.addLayout(descLayout)
+
+        # Search description
+        searchLayout = QHBoxLayout()
+        self.searchInput = QLineEdit(self)
+        self.searchInput.setPlaceholderText('Search Description')
+        searchLayout.addWidget(self.searchInput)
+
+        self.searchButton = QPushButton('Search', self)
+        # (Not wired in your original code, but present in the layout)
+        searchLayout.addWidget(self.searchButton)
+        layout.addLayout(searchLayout)
+
+        # Mode settings
+        modeLayout = QVBoxLayout()
+        modeSelectLayout = QHBoxLayout()
+        self.modeCombo = QComboBox(self)
+        self.modeCombo.addItems(['Access', 'Trunk'])
+        modeSelectLayout.addWidget(QLabel('Select Mode:'))
+        modeSelectLayout.addWidget(self.modeCombo)
+        modeLayout.addLayout(modeSelectLayout)
+
+        self.modeButton = QPushButton('Set Mode', self)
+        self.modeButton.clicked.connect(self.change_mode)
+        modeLayout.addWidget(self.modeButton)
+
+        # Allowed VLANs
+        allowedVlanLayout = QHBoxLayout()
+        self.allowedVlansInput = QLineEdit(self)
+        self.allowedVlansInput.setPlaceholderText('Enter Allowed VLANs (comma-separated)')
+        allowedVlanLayout.addWidget(self.allowedVlansInput)
+
+        self.allowedVlansButton = QPushButton('Set Allowed VLANs', self)
+        self.allowedVlansButton.clicked.connect(self.set_allowed_vlans)
+        allowedVlanLayout.addWidget(self.allowedVlansButton)
+        modeLayout.addLayout(allowedVlanLayout)
+        layout.addLayout(modeLayout)
+
+        # Single VLAN operation
+        singleOperationLayout = QHBoxLayout()
+        self.vlanInput = QLineEdit(self)
+        self.vlanInput.setPlaceholderText('Enter VLAN ID for Single Interface')
+        singleOperationLayout.addWidget(self.vlanInput)
+
+        self.vlanButton = QPushButton('Set VLAN for Interface', self)
+        self.vlanButton.clicked.connect(self.change_vlan)
+        singleOperationLayout.addWidget(self.vlanButton)
+
+        self.showConfigButton = QPushButton('Show Running Config', self)
+        self.showConfigButton.clicked.connect(self.show_running_config)
+        singleOperationLayout.addWidget(self.showConfigButton)
+        layout.addLayout(singleOperationLayout)
+
+        self.setLayout(layout)
+        logging.info('Single-file application initialized.')
+
+    # --------------------------------------------------------------------
+    # MAIN INTERFACE FETCHING AND PARSING
+    # --------------------------------------------------------------------
+    def fetch_interfaces(self):
+        """
+        Starts multiple NetmikoThread instances to fetch interface data:
+        'show interface status', 'show interface switchport',
+        'show interface description', 'show vlan brief'.
+        """
+        host, username, password = self.get_credentials()
+        if not (host and username and password):
+            return
+
+        self.show_toast('Fetching interfaces...')
+        logging.info('Fetching interfaces from the switch.')
+
+        # Show interface status
+        self.status_thread = NetmikoThread(host, username, password, ['show interface status'])
+        self.status_thread.output_signal.connect(self.update_interface_status)
+        self.status_thread.error_signal.connect(self.show_error)
+        self.status_thread.start()
+
+        # Show interface switchport
+        self.switchport_thread = NetmikoThread(host, username, password, ['show interface switchport'])
+        self.switchport_thread.output_signal.connect(self.update_interface_switchport)
+        self.switchport_thread.error_signal.connect(self.show_error)
+        self.switchport_thread.start()
+
+        # Show interface description
+        self.description_thread = NetmikoThread(host, username, password, ['show interface description'])
+        self.description_thread.output_signal.connect(self.update_interface_description)
+        self.description_thread.error_signal.connect(self.show_error)
+        self.description_thread.start()
+
+        # Show vlan brief
+        self.vlan_thread = NetmikoThread(host, username, password, ['show vlan brief'])
+        self.vlan_thread.output_signal.connect(self.update_vlan_info)
+        self.vlan_thread.error_signal.connect(self.show_error)
+        self.vlan_thread.start()
+
+    def update_interface_status(self, output):
+        """
+        Parse 'show interface status' output.
+        """
+        self.interface_status = {}
+        for line in output.splitlines():
+            # Typically lines start with Gi, Fa, Eth, Te, etc. Example:
+            # Gi1/0/1   connected    ... VLAN ...
+            if line.startswith(('Gi', 'Fa', 'Eth', 'Te')):
+                parts = line.split()
+                if len(parts) >= 4:
+                    interface = parts[0].strip()
+                    status = parts[1].strip()
+                    vlan = parts[3].strip()
+                    if vlan.isdigit():
+                        mode = 'access'
+                    elif vlan.lower() == 'trunk':
+                        mode = 'trunk'
+                    else:
+                        mode = 'unknown'
+                    self.interface_status[interface] = {
+                        'status': status,
+                        'vlan': vlan,
+                        'mode': mode
+                    }
+        self.update_interface_table()
+
+    def update_interface_switchport(self, output):
+        """
+        Parse 'show interface switchport' output for additional data.
+        """
+        self.interface_switchport = {}
+        lines = output.splitlines()
+        for line in lines:
+            if line.startswith(('Gi', 'Fa', 'Eth', 'Te')):
+                parts = line.split()
+                interface = parts[0].strip() if len(parts) > 0 else ''
+                mode = parts[1].strip() if len(parts) > 1 else 'N/A'
+                vlan = parts[2].strip() if len(parts) > 2 else 'N/A'
+                if interface:
+                    self.interface_switchport[interface] = {
+                        'mode': mode,
+                        'vlan': vlan
+                    }
+        self.update_interface_table()
+
+    def update_interface_description(self, output):
+        """
+        Parse 'show interface description' output for interface descriptions.
+        If no description is found, store "Null".
+        """
+        self.interface_description = {}
+        for line in output.splitlines():
+            # Skip header & separator lines
+            if line.strip().startswith(('Interface', '-----')):
+                continue
+
+            parts = line.split(None, 3)
+            if len(parts) >= 1 and parts[0].startswith(('Gi', 'Fa', 'Eth', 'Te')):
+                interface = parts[0].strip()
+                if len(parts) == 4:
+                    description = parts[3].strip()
+                    if not description:
+                        description = "Null"
+                else:
+                    description = "Null"
+                self.interface_description[interface] = description
+        self.update_interface_table()
+
+    def update_vlan_info(self, output):
+        """
+        Parse 'show vlan brief' output for VLAN membership info.
+        """
+        self.vlan_info = {}
+        for line in output.splitlines():
+            if line.strip().startswith(('VLAN', '---')):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                vlan_id = parts[0].strip()
+                interfaces = parts[2:]
+                for iface in interfaces:
+                    iface = iface.strip()
+                    if iface not in self.vlan_info:
+                        self.vlan_info[iface] = []
+                    self.vlan_info[iface].append(vlan_id)
+        self.update_interface_table()
+
+    def update_interface_table(self):
+        """
+        Combine the interface data into the QTableWidget view.
+        """
+        if not self.interface_status:
+            return
+
+        self.interfaceTable.setRowCount(0)
+        for interface, st_info in self.interface_status.items():
+            row_position = self.interfaceTable.rowCount()
+            self.interfaceTable.insertRow(row_position)
+
+            # Checkbox
+            select_checkbox = QCheckBox(self)
+            self.interfaceTable.setCellWidget(row_position, 0, select_checkbox)
+
+            # Interface name
+            self.interfaceTable.setItem(row_position, 1, QTableWidgetItem(interface))
+
+            # Description
+            description = self.interface_description.get(interface, 'Null')
+            self.interfaceTable.setItem(row_position, 2, QTableWidgetItem(description))
+
+            # Mode
+            mode = st_info.get('mode', 'unknown')
+            self.interfaceTable.setItem(row_position, 3, QTableWidgetItem(mode))
+
+            # VLAN
+            vlan = st_info.get('vlan', 'N/A')
+            self.interfaceTable.setItem(row_position, 4, QTableWidgetItem(vlan))
+
+            # Status
+            status = st_info.get('status', 'N/A')
+            status_item = QTableWidgetItem(status)
+            if status.lower() == 'connected':
+                status_item.setBackground(QBrush(QColor(144, 238, 144)))
+            elif status.lower() == 'notconnect':
+                status_item.setBackground(QBrush(QColor(255, 255, 0)))
+            elif status.lower() == 'disabled':
+                status_item.setBackground(QBrush(QColor(255, 0, 0)))
+            self.interfaceTable.setItem(row_position, 5, status_item)
+
+            # Bring Up/Down buttons
+            up_button = QPushButton('Bring Up', self)
+            up_button.setStyleSheet("background-color: green; color: white;")
+            up_button.clicked.connect(partial(self.bring_interface_up, interface))
+            self.interfaceTable.setCellWidget(row_position, 6, up_button)
+
+            down_button = QPushButton('Bring Down', self)
+            down_button.setStyleSheet("background-color: red; color: white;")
+            down_button.clicked.connect(partial(self.bring_interface_down, interface))
+            self.interfaceTable.setCellWidget(row_position, 7, down_button)
+
+    # --------------------------------------------------------------------
+    # COMMAND METHODS
+    # --------------------------------------------------------------------
+    def bring_interface_up(self, interface):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        commands = [f'interface {interface}', 'no shutdown']
+        msg = f'Bringing up {interface}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def bring_interface_down(self, interface):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        commands = [f'interface {interface}', 'shutdown']
+        msg = f'Bringing down {interface}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def change_vlan(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        selected_row = self.interfaceTable.currentRow()
+        if selected_row == -1:
+            self.show_toast('Please select an interface after fetching.')
+            return
+        interface = self.interfaceTable.item(selected_row, 1).text()
+        vlan_id = self.vlanInput.text().strip()
+        if not vlan_id:
+            self.show_toast('Please enter a VLAN ID.')
+            return
+        commands = [f'interface {interface}', f'switchport access vlan {vlan_id}']
+        msg = f'Changing VLAN for {interface} to {vlan_id}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def bulk_change_vlan(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        vlan_id = self.bulkVlanInput.text().strip()
+        if not vlan_id:
+            self.show_toast('Please enter a VLAN ID for bulk operation.')
+            return
+        selected_interfaces = self.get_selected_interfaces()
+        if not selected_interfaces:
+            self.show_toast('No interfaces selected for bulk operation.')
+            return
+        commands = []
+        for iface in selected_interfaces:
+            commands.append(f'interface {iface}')
+            commands.append(f'switchport access vlan {vlan_id}')
+        msg = f'Bulk changing VLAN to {vlan_id} for selected interfaces...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def change_description(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        selected_row = self.interfaceTable.currentRow()
+        if selected_row == -1:
+            self.show_toast('Please select an interface after fetching.')
+            return
+        interface = self.interfaceTable.item(selected_row, 1).text()
+        description = self.descInput.text().strip()
+        if not description:
+            description = "Null"
+        commands = [f'interface {interface}', f'description {description}']
+        msg = f'Changing description for {interface}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def bulk_set_mode(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        mode = self.bulkModeCombo.currentText().lower()
+        selected_interfaces = self.get_selected_interfaces()
+        if not selected_interfaces:
+            self.show_toast('No interfaces selected for bulk operation.')
+            return
+        commands = []
+        for iface in selected_interfaces:
+            commands.append(f'interface {iface}')
+            if mode == 'trunk':
+                commands.append('switchport trunk encapsulation dot1q')
+            commands.append(f'switchport mode {mode}')
+        msg = f'Bulk setting mode to {mode} for selected interfaces...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def change_mode(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        selected_row = self.interfaceTable.currentRow()
+        if selected_row == -1:
+            self.show_toast('Please select an interface after fetching.')
+            return
+        interface = self.interfaceTable.item(selected_row, 1).text()
+        mode = self.modeCombo.currentText().lower()
+        commands = [f'interface {interface}']
+        if mode == 'trunk':
+            commands.append('switchport trunk encapsulation dot1q')
+        commands.append(f'switchport mode {mode}')
+        msg = f'Changing mode for {interface} to {mode}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def set_allowed_vlans(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        selected_row = self.interfaceTable.currentRow()
+        if selected_row == -1:
+            self.show_toast('Please select an interface after fetching.')
+            return
+        interface = self.interfaceTable.item(selected_row, 1).text()
+        allowed_vlans = self.allowedVlansInput.text().strip()
+        if not allowed_vlans:
+            self.show_toast('Please enter allowed VLANs.')
+            return
+        commands = [f'interface {interface}', f'switchport trunk allowed vlan {allowed_vlans}']
+        msg = f'Setting allowed VLANs for {interface} to {allowed_vlans}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+    def show_running_config(self):
+        host, user, pwd = self.get_credentials()
+        if not (host and user and pwd):
+            return
+        selected_row = self.interfaceTable.currentRow()
+        if selected_row == -1:
+            self.show_toast('Please select an interface after fetching.')
+            return
+        interface = self.interfaceTable.item(selected_row, 1).text()
+        commands = [f'show running-config interface {interface}']
+        msg = f'Showing running config for {interface}...'
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, False)
+
+    # --------------------------------------------------------------------
+    # UTILITY METHODS
+    # --------------------------------------------------------------------
+    def get_credentials(self):
+        """
+        Retrieve and validate credential fields.
+        """
+        host = self.hostInput.text().strip()
+        user = self.usernameInput.text().strip()
+        pwd = self.passwordInput.text().strip()
+        if not (host and user and pwd):
+            self.show_toast('Ensure IP, username, and password are all filled.')
+            return None, None, None
+        return host, user, pwd
+
+    def get_selected_interfaces(self):
+        """
+        Return a list of all checked interfaces from the QTableWidget.
+        """
+        selected = []
+        for row in range(self.interfaceTable.rowCount()):
+            checkbox = self.interfaceTable.cellWidget(row, 0)
+            if checkbox and checkbox.isChecked():
+                iface = self.interfaceTable.item(row, 1).text()
+                selected.append(iface)
+        return selected
+
+    def execute_netmiko_commands(self, host, user, pwd, commands, msg, config_mode):
+        """
+        Fire off a NetmikoThread to execute a list of commands in config or exec mode.
+        """
+        self.show_toast(msg)
+        logging.info(msg)
+        thread = NetmikoThread(host, user, pwd, commands, config_mode=config_mode)
+        thread.output_signal.connect(self.show_success)
+        thread.error_signal.connect(self.show_error)
+        thread.start()
+
+    def show_toast(self, message):
+        """
+        Helper to show a simple dialog message in PyQt.
+        """
+        toast = QMessageBox(self)
+        toast.setWindowTitle('Notification')
+        toast.setText(message)
+        toast.setStandardButtons(QMessageBox.StandardButton.Ok)
+        toast.exec()
+
+    # --------------------------------------------------------------------
+    # THREAD SIGNAL HANDLERS
+    # --------------------------------------------------------------------
+    def show_success(self, output):
+        self.show_toast(f'Operation completed successfully.\nOutput:\n{output}')
+        logging.info(f'Operation completed successfully. Output: {output}')
+        self.fetch_interfaces()  # Refresh interface data
+
+    def show_error(self, error):
+        self.show_toast(f'Command failed.\nError: {error}')
+        logging.error(f'Command failed. Error: {error}')
+
+    # --------------------------------------------------------------------
+    # TOGGLE DARK MODE
+    # --------------------------------------------------------------------
+    def toggle_dark_mode(self):
+        if not self.dark_mode_enabled:
+            dark_palette = QPalette()
+            dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+            dark_palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
+            dark_palette.setColor(QPalette.ColorRole.Base, QColor(42, 42, 42))
+            dark_palette.setColor(QPalette.ColorRole.AlternateBase, QColor(66, 66, 66))
+            dark_palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 255))
+            dark_palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
+            dark_palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+            dark_palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+            dark_palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
+            dark_palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+            dark_palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+            dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+            dark_palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+            self.setPalette(dark_palette)
+        else:
+            light_palette = QPalette()
+            self.setPalette(light_palette)
+        self.dark_mode_enabled = not self.dark_mode_enabled
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = CiscoInterfaceControl()
+    window.show()
+    sys.exit(app.exec())
