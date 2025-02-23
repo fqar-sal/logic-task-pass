@@ -169,7 +169,7 @@ class CiscoInterfaceControl(QWidget):
         self.interfaceTable = QTableWidget(self)
         self.interfaceTable.setColumnCount(7)  # Changed to 7 columns
         self.interfaceTable.setHorizontalHeaderLabels([
-            'Select', 'Interface', 'Description', 'Mode', 'VLAN', 'Link Status', 'Toggle'  # Removed 'Status'
+            'Select', 'Interface', 'Description', 'Mode', 'Link-status', 'Vlan', 'Toggle'  # Removed 'Status'
         ])
         self.interfaceTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.interfaceTable.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
