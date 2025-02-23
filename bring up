@@ -6,7 +6,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, QTimer, QPropertyAnimation
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton,
     QLabel, QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
-    QGroupBox, QTabWidget, QGraphicsOpacityEffect
+    QGroupBox, QTabWidget, QGraphicsOpacityEffect, QPlainTextEdit
 )
 from PyQt6.QtGui import QColor, QPalette, QBrush
 from netmiko import ConnectHandler
@@ -16,7 +16,7 @@ from netmiko import ConnectHandler
 # ------------------------------------------------------------------------
 logging.basicConfig(
     filename='network_manager.log',
-    level=logging.INFO,
+    level=logging.DEBUG,  # Set to DEBUG for more detailed logs
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -37,17 +37,23 @@ class NetmikoThread(QThread):
 
     def run(self):
         try:
+            logging.debug("NetmikoThread started.")
             connection = self.connect_to_device()
             output = self.send_commands(connection)
             connection.disconnect()  # Cleanly close connection
+            logging.debug("NetmikoThread finished sending commands.")
             self.output_signal.emit(output)
         except Exception as e:
+            logging.error(f"NetmikoThread encountered an error: {e}")
             self.error_signal.emit(str(e))
 
     def connect_to_device(self):
         """
         Establish a Netmiko SSH connection to the device with optional enable/config mode.
         Return an active connection or raise an exception if it fails.
+
+        Removed 'read_timeout' parameter to maintain compatibility with older Netmiko versions.
+        For longer outputs, increase 'timeout', 'conn_timeout', or 'global_delay_factor' if needed.
         """
         try:
             device_params = {
@@ -60,6 +66,7 @@ class NetmikoThread(QThread):
                 'conn_timeout': 15,
                 'auth_timeout': 5
             }
+            logging.debug(f"Connecting to device {self.host} with user {self.username}.")
             connection = ConnectHandler(**device_params)
             if self.config_mode:
                 connection.enable()
@@ -71,14 +78,14 @@ class NetmikoThread(QThread):
     def send_commands(self, connection):
         """
         Send commands to the device in either config or exec mode.
-        To avoid hanging issues (especially with 'no shutdown' commands),
+        To avoid hanging issues (especially with 'no shutdown' or 'shutdown'),
         we disable command verification by setting cmd_verify=False.
         Return the combined output string from all commands.
         """
         output = ""
         try:
             if self.config_mode:
-                # cmd_verify=False avoids checking echoed commands which sometimes causes hangs.
+                logging.debug(f"Sending config commands: {self.commands}")
                 output += connection.send_config_set(
                     self.commands,
                     enter_config_mode=True,
@@ -87,6 +94,7 @@ class NetmikoThread(QThread):
                     delay_factor=1
                 )
             else:
+                logging.debug(f"Sending exec commands: {self.commands}")
                 for cmd in self.commands:
                     output += connection.send_command(cmd, delay_factor=1)
                     output += "\n"
@@ -115,7 +123,7 @@ class CiscoInterfaceControl(QWidget):
 
     def initUI(self):
         """
-        Sets up the PyQt UI with tabs.
+        Sets up the PyQt UI with tabs, including a tab to display copyable debug logs.
         """
         self.setWindowTitle('Cisco Interface & VLAN Control')
         self.setGeometry(100, 100, 1200, 900)
@@ -157,7 +165,7 @@ class CiscoInterfaceControl(QWidget):
         self.interfaceTab = QWidget()
         intLayout = QVBoxLayout()
 
-        # Interface Table with 7 columns (includes combined Toggle button)
+        # Interface Table with 7 columns (includes a toggle button)
         self.interfaceTable = QTableWidget(self)
         self.interfaceTable.setColumnCount(7)
         self.interfaceTable.setHorizontalHeaderLabels([
@@ -243,22 +251,22 @@ class CiscoInterfaceControl(QWidget):
 
         self.interfaceTab.setLayout(intLayout)
 
-        # Create the Protocol Status tab
-        self.protocolTab = QWidget()
-        protLayout = QVBoxLayout()
-        self.protocolTable = QTableWidget(self)
-        self.protocolTable.setColumnCount(4)
-        self.protocolTable.setHorizontalHeaderLabels([
-            'Interface', 'IP Address', 'Status', 'Protocol'
-        ])
-        self.protocolTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        protLayout.addWidget(self.protocolTable)
-        self.protocolTab.setLayout(protLayout)
+        # Create a Debug Logs tab to display logs in a copyable text field
+        self.debugTab = QWidget()
+        debugLayout = QVBoxLayout()
+        self.debugTextBox = QPlainTextEdit(self)
+        self.debugTextBox.setReadOnly(True)
+        debugLayout.addWidget(self.debugTextBox)
+
+        self.loadLogsButton = QPushButton("Load Logs", self)
+        self.loadLogsButton.clicked.connect(self.load_logs)
+        debugLayout.addWidget(self.loadLogsButton)
+        self.debugTab.setLayout(debugLayout)
 
         # Add tabs to the QTabWidget
         self.tabs.addTab(self.interfaceTab, "Interfaces")
-        self.tabs.addTab(self.protocolTab, "Protocol Status")
         mainLayout.addWidget(self.tabs)
+        self.tabs.addTab(self.debugTab, "Debug Logs")
 
         # Non-blocking notifications
         self.notificationLabel = QLabel('')
@@ -299,17 +307,27 @@ class CiscoInterfaceControl(QWidget):
 
     def update_interface_status(self, output):
         """
-        Parse 'show interface status' output.
+        Parse 'show interface status' output to get interface, status, VLAN, etc.
+        This captures more raw status values like 'connected', 'notconnect', 'disabled', 'err-disabled', etc.
         """
         self.interface_status = {}
         for line in output.splitlines():
-            match = re.match(r'(\S+)\s+([\w-]+)\s+.*?\s+([\w-]+)\s+(.*)', line)
+            # Typically lines look like: Gi1/0/1 connected trunk a-full a-100 10/100/1000BaseTX
+            # We'll capture interface, status, vlan/mode, ignoring extra fields
+            match = re.match(r'(\S+)\s+(\S+)\s+(\S+)\s+(.*)', line)
             if match:
-                interface, status, vlan, _ = match.groups()
+                interface, status, vlan, rest = match.groups()
                 interface = interface.strip()
-                status = status.strip()
+                status = status.strip().lower()  # raw status
                 vlan = vlan.strip()
-                mode = 'access' if vlan.isdigit() else ('trunk' if vlan.lower() == 'trunk' else 'unknown')
+                # If the "vlan" field is purely numeric, consider it "access"
+                # If it's "trunk", consider it trunk, else unknown
+                if vlan.isdigit():
+                    mode = 'access'
+                elif vlan.lower() == 'trunk':
+                    mode = 'trunk'
+                else:
+                    mode = 'unknown'
                 self.interface_status[interface] = {
                     'status': status,
                     'vlan': vlan,
@@ -319,7 +337,7 @@ class CiscoInterfaceControl(QWidget):
 
     def update_interface_switchport(self, output):
         """
-        Parse 'show interface switchport' output.
+        Parse 'show interface switchport' output to get interface mode and VLANs.
         """
         self.interface_switchport = {}
         for line in output.splitlines():
@@ -327,7 +345,7 @@ class CiscoInterfaceControl(QWidget):
             if match:
                 interface = match.group(1).strip()
                 mode = match.group(2).strip()
-                vlan_match = re.search(r'Access Mode VLAN:.*?(\d+)', line)
+                vlan_match = re.search(r'Access Mode VLAN:\s+(\d+)', line)
                 vlan = vlan_match.group(1) if vlan_match else 'N/A'
                 if interface:
                     self.interface_switchport[interface] = {
@@ -338,28 +356,23 @@ class CiscoInterfaceControl(QWidget):
 
     def update_interface_description(self, output):
         """
-        Parse 'show interface description' output.
+        Parse 'show interface description' output to get interface descriptions.
         """
         self.interface_description = {}
         for line in output.splitlines():
-            if re.match(r'Interface\s+Status\s+Protocol\s+Description', line) or re.match(r'---------', line):
+            if (re.match(r'Interface\s+Status\s+Protocol\s+Description', line) or
+                    re.match(r'---------', line)):
                 continue
-            match = re.match(r'(\S+)\s+.*?administratively down.*?(\S+)', line)
-            if match:
-                interface = match.group(1).strip()
-                description = match.group(2).strip() or "Null"
-                self.interface_description[interface] = description
-            else:
-                match = re.match(r'(\S+)\s+.*?(\S+)', line)
-                if match:
-                    interface = match.group(1).strip()
-                    description = match.group(2).strip() or "Null"
-                    self.interface_description[interface] = description
+            parts = line.split()
+            if len(parts) >= 4:
+                interface = parts[0]
+                desc = ' '.join(parts[3:]) if len(parts) > 3 else 'Null'
+                self.interface_description[interface] = desc.strip()
         self.update_interface_table()
 
     def update_vlan_info(self, output):
         """
-        Parse 'show vlan brief' output.
+        Parse 'show vlan brief' output to see which interfaces belong to which VLANs.
         """
         self.vlan_info = {}
         for line in output.splitlines():
@@ -368,16 +381,18 @@ class CiscoInterfaceControl(QWidget):
             match = re.match(r'(\d+)\s+\S+\s+\w+\s+(.*)', line)
             if match:
                 vlan_id = match.group(1).strip()
-                interfaces = [iface.strip() for iface in match.group(2).split(',')]
-                for iface in interfaces:
-                    if iface not in self.vlan_info:
-                        self.vlan_info[iface] = []
-                    self.vlan_info[iface].append(vlan_id)
+                interfaces_part = match.group(2)
+                if interfaces_part:
+                    interfaces = [iface.strip() for iface in interfaces_part.split(',')]
+                    for iface in interfaces:
+                        if iface not in self.vlan_info:
+                            self.vlan_info[iface] = []
+                        self.vlan_info[iface].append(vlan_id)
         self.update_interface_table()
 
     def update_protocol_table(self, output):
         """
-        Parse 'show ip interface brief' output.
+        Parse 'show ip interface brief' output to fill protocolTable with interface details.
         """
         self.protocol_info = {}
         lines = output.splitlines()
@@ -399,13 +414,13 @@ class CiscoInterfaceControl(QWidget):
                     'status': status,
                     'protocol': protocol
                 }
-        self.refresh_protocol_table()
 
     def update_interface_table(self):
         """
-        Update the interface table view.
+        Refresh and populate the interface table with current data.
         """
         if not self.interface_status:
+            logging.debug("No interface status data to show.")
             return
 
         self.interfaceTable.setRowCount(0)
@@ -417,23 +432,29 @@ class CiscoInterfaceControl(QWidget):
             checkbox = QCheckBox(self)
             self.interfaceTable.setCellWidget(row_position, 0, checkbox)
 
+            # Interface column
             self.interfaceTable.setItem(row_position, 1, QTableWidgetItem(interface))
+
+            # Description column
             description = self.interface_description.get(interface, 'Null')
             self.interfaceTable.setItem(row_position, 2, QTableWidgetItem(description))
+
+            # Mode column
             mode = st_info.get('mode', 'unknown')
             self.interfaceTable.setItem(row_position, 3, QTableWidgetItem(mode))
+
+            # VLAN column
             vlan = st_info.get('vlan', 'N/A')
             self.interfaceTable.setItem(row_position, 4, QTableWidgetItem(vlan))
-            status = st_info.get('status', 'N/A')
+
+            # Show actual status (e.g., connected, notconnect, disabled, err-disabled, etc.)
+            status = st_info.get('status', 'unknown')
             status_item = QTableWidgetItem(status)
-            if status.lower() == 'connected':
-                status_item.setBackground(QBrush(QColor(144, 238, 144)))
-            else:
-                status_item.setBackground(QBrush(QColor(255, 99, 71)))
+            # Remove color-coded backgrounds to keep only one status representation
             self.interfaceTable.setItem(row_position, 5, status_item)
 
-            # Combined Toggle Button with animated fade effect.
-            if status.lower() == "connected":
+            # Toggle button based on status
+            if status == "connected":
                 button_text = "Bring Down"
                 button_style = "background-color: red; color: white;"
             else:
@@ -444,38 +465,26 @@ class CiscoInterfaceControl(QWidget):
             toggle_button.clicked.connect(partial(self.toggle_interface, interface))
             self.interfaceTable.setCellWidget(row_position, 6, toggle_button)
 
-    def refresh_protocol_table(self):
-        """
-        Update the protocol table view.
-        """
-        self.protocolTable.setRowCount(0)
-        for interface, info in self.protocol_info.items():
-            row = self.protocolTable.rowCount()
-            self.protocolTable.insertRow(row)
-            self.protocolTable.setItem(row, 0, QTableWidgetItem(interface))
-            self.protocolTable.setItem(row, 1, QTableWidgetItem(info.get('ip', 'N/A')))
-            self.protocolTable.setItem(row, 2, QTableWidgetItem(info.get('status', 'N/A')))
-            self.protocolTable.setItem(row, 3, QTableWidgetItem(info.get('protocol', 'N/A')))
-
     # --------------------------------------------------------------------
     # COMMAND METHODS
     # --------------------------------------------------------------------
     def toggle_interface(self, interface):
         """
         Toggle interface status based on current status.
-        If the interface is down then send "no shutdown" (Bring Up);
-        if the interface is up then send "shutdown" (Bring Down).
-        Animate the toggle button corresponding to the interface.
+        If the interface is 'connected' => send "shutdown" (Bring Down).
+        Otherwise => send "no shutdown" (Bring Up).
         """
         current_status = self.interface_status.get(interface, {}).get('status', '').lower()
+        logging.debug(f"toggle_interface called for {interface}, status: {current_status}")
         host, user, pwd = self.get_credentials()
         if not (host and user and pwd):
+            self.update_notification("Credentials missing.")
             return
 
-        # Locate the toggle button for animation
+        # Locate the toggle button for animation (optional fade effect)
         button = None
         for row in range(self.interfaceTable.rowCount()):
-            if self.interfaceTable.item(row, 1).text() == interface:
+            if self.interfaceTable.item(row, 1) and self.interfaceTable.item(row, 1).text() == interface:
                 button = self.interfaceTable.cellWidget(row, 6)
                 break
         if button:
@@ -485,7 +494,8 @@ class CiscoInterfaceControl(QWidget):
             anim.setDuration(500)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
-            anim.start(QPropertyAnimation.DeleteWhenStopped)
+            anim.start()
+            anim.finished.connect(lambda: anim.deleteLater())
 
         if current_status == "connected":
             commands = [f'interface {interface}', 'shutdown']
@@ -493,7 +503,8 @@ class CiscoInterfaceControl(QWidget):
         else:
             commands = [f'interface {interface}', 'no shutdown']
             msg = f'Bringing up {interface}...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def change_vlan(self):
         host, user, pwd = self.get_credentials()
@@ -510,7 +521,7 @@ class CiscoInterfaceControl(QWidget):
             return
         commands = [f'interface {interface}', f'switchport access vlan {vlan_id}']
         msg = f'Changing VLAN for {interface} to {vlan_id}...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def bulk_change_vlan(self):
         host, user, pwd = self.get_credentials()
@@ -529,7 +540,7 @@ class CiscoInterfaceControl(QWidget):
             commands.append(f'interface {iface}')
             commands.append(f'switchport access vlan {vlan_id}')
         msg = f'Bulk changing VLAN to {vlan_id} for selected interfaces...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def change_description(self):
         host, user, pwd = self.get_credentials()
@@ -543,7 +554,7 @@ class CiscoInterfaceControl(QWidget):
         description = self.descInput.text().strip() or "Null"
         commands = [f'interface {interface}', f'description {description}']
         msg = f'Changing description for {interface}...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def bulk_set_mode(self):
         host, user, pwd = self.get_credentials()
@@ -561,7 +572,7 @@ class CiscoInterfaceControl(QWidget):
                 commands.append('switchport trunk encapsulation dot1q')
             commands.append(f'switchport mode {mode}')
         msg = f'Bulk setting mode to {mode} for selected interfaces...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def change_mode(self):
         host, user, pwd = self.get_credentials()
@@ -578,7 +589,7 @@ class CiscoInterfaceControl(QWidget):
             commands.append('switchport trunk encapsulation dot1q')
         commands.append(f'switchport mode {mode}')
         msg = f'Changing mode for {interface} to {mode}...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def set_allowed_vlans(self):
         host, user, pwd = self.get_credentials()
@@ -595,7 +606,7 @@ class CiscoInterfaceControl(QWidget):
             return
         commands = [f'interface {interface}', f'switchport trunk allowed vlan {allowed_vlans}']
         msg = f'Setting allowed VLANs for {interface} to {allowed_vlans}...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, True)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=True)
 
     def show_running_config(self):
         host, user, pwd = self.get_credentials()
@@ -608,14 +619,14 @@ class CiscoInterfaceControl(QWidget):
         interface = self.interfaceTable.item(selected_row, 1).text()
         commands = [f'show running-config interface {interface}']
         msg = f'Showing running config for {interface}...'
-        self.execute_netmiko_commands(host, user, pwd, commands, msg, False)
+        self.execute_netmiko_commands(host, user, pwd, commands, msg, config_mode=False)
 
     # --------------------------------------------------------------------
     # UTILITY METHODS
     # --------------------------------------------------------------------
     def get_credentials(self):
         """
-        Retrieve and validate credential fields.
+        Retrieve and validate credential fields from the GUI.
         """
         host = self.hostInput.text().strip()
         user = self.usernameInput.text().strip()
@@ -639,10 +650,11 @@ class CiscoInterfaceControl(QWidget):
 
     def execute_netmiko_commands(self, host, user, pwd, commands, msg, config_mode):
         """
-        Start a NetmikoThread to execute commands.
+        Start a NetmikoThread to execute commands asynchronously.
         """
         self.update_notification(msg)
         logging.info(msg)
+        logging.debug(f"execute_netmiko_commands => host: {host}, user: {user}, commands: {commands}")
         thread = NetmikoThread(host, user, pwd, commands, config_mode=config_mode)
         thread.output_signal.connect(self.show_success)
         thread.error_signal.connect(self.show_error)
@@ -650,15 +662,29 @@ class CiscoInterfaceControl(QWidget):
         self.threads.append(thread)
         thread.start()
 
+    def load_logs(self):
+        """
+        Load all content from network_manager.log into the debug text box for easy copying.
+        """
+        try:
+            with open('network_manager.log', 'r', encoding='utf-8') as f:
+                logs = f.read()
+            self.debugTextBox.setPlainText(logs)
+            self.update_notification("Logs loaded for viewing.")
+        except Exception as e:
+            err_msg = f"Unable to load logs: {e}"
+            self.update_notification(err_msg)
+            logging.error(err_msg)
+
     def update_notification(self, message):
         """
-        Update the non-blocking notification label.
+        Display a temporary non-blocking notification label on the UI.
         """
         self.notificationLabel.setText(message)
 
     def show_success(self, output):
-        self.update_notification(f'Operation completed successfully. Output: {output}')
-        logging.info(f'Operation completed successfully. Output: {output}')
+        self.update_notification(f'Operation completed successfully. Output: {output.strip()}')
+        logging.info(f'Operation completed successfully. Output: {output.strip()}')
         QTimer.singleShot(100, self.fetch_interfaces)
 
     def show_error(self, error):
@@ -669,6 +695,9 @@ class CiscoInterfaceControl(QWidget):
     # TOGGLE DARK MODE
     # --------------------------------------------------------------------
     def toggle_dark_mode(self):
+        """
+        Simple example of toggling the app's QPalette for a dark or light theme.
+        """
         if not self.dark_mode_enabled:
             dark_palette = QPalette()
             dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
@@ -685,9 +714,11 @@ class CiscoInterfaceControl(QWidget):
             dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
             dark_palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
             self.setPalette(dark_palette)
+            logging.debug("Dark mode enabled.")
         else:
             light_palette = QPalette()
             self.setPalette(light_palette)
+            logging.debug("Dark mode disabled.")
         self.dark_mode_enabled = not self.dark_mode_enabled
 
 if __name__ == '__main__':
